@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"inet.af/netaddr"
+	"net"
 	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"inet.af/netaddr"
 	// "sync"
 )
 
@@ -36,35 +38,55 @@ func init() {
 		line := scanner.Text()
 		switch {
 		case strings.Contains(line, "IPTABLES"):
+			lines = append(lines, line)
 		case strings.Contains(line, "IP DROP"):
+			lines = append(lines, line)
 		case strings.Contains(line, "UFW"):
+			lines = append(lines, line)
 		case strings.Contains(line, "DPT=") && strings.Contains(line, "SPT="):
 			lines = append(lines, line)
+		default:
 		}
 	}
 	fmt.Println("loaded lines from log: ", len(lines))
 }
 
+// LogEntry represents a parsed netfilter block entry from syslog.
 type LogEntry struct {
-	Interface   string
+	Interface string
+	Protocol  string
+	MAC       string
+
+	Window int
+	Length int
+
 	Destination netaddr.IPPort
-	Protocol    string
-	TCPFlags    []string
-	Window      int
 	Source      netaddr.IPPort
-	Time        time.Time
-	MAC         string
+
+	Loopback bool
+	LAN      bool
+
+	TCPFlags []string
+
+	Time time.Time
 }
 
+// SrcStat represents the statistics of a given source address.
 type SrcStat struct {
 	Source string
 	Length int
 }
 
+// Counts is a collection of our statistics.
 type Counts []SrcStat
 
-func (c Counts) Len() int           { return len(c) }
-func (c Counts) Swap(i, j int)      { c[i], c[j] = c[j], c[i] }
+// Len returns the amount of source addresses we have.
+func (c Counts) Len() int { return len(c) }
+
+// Swap swaps the position of two indexed values within our source address statistics.
+func (c Counts) Swap(i, j int) { c[i], c[j] = c[j], c[i] }
+
+// Less returns if an indexed item (i) in our source address statistics is of lesser value than (j).
 func (c Counts) Less(i, j int) bool { return c[i].Length < c[j].Length }
 
 func parseTime(split []string) time.Time {
@@ -93,9 +115,8 @@ func clean(s []string) []string {
 func truncate(item, substr string) string {
 	if strings.Contains(item, substr) {
 		return strings.TrimPrefix(item, substr)
-	} else {
-		return ""
 	}
+	return ""
 }
 
 func v6adapt(addr string) string {
@@ -105,29 +126,22 @@ func v6adapt(addr string) string {
 	return addr
 }
 
-func process(line string) LogEntry {
-	split := strings.Split(line, " ")
-	split = clean(split)
-	l := LogEntry{}
-	l.Time = parseTime(split)
+func mapValues(split []string) map[string]*string {
 
 	var (
-		srcaddr string
-		srcport string
-		dstaddr string
-		dstport string
-		proto   string
-		macaddr string
+		ipinterface, srcaddr, srcport, dstaddr, dstport, proto, macaddr, tcpf, length string
 	)
 
 	var atlas = map[string]*string{
-		"IN":    &l.Interface,
+		"IN":    &ipinterface,
 		"SRC":   &srcaddr,
 		"SPT":   &srcport,
 		"DPT":   &dstport,
 		"DST":   &dstaddr,
 		"PROTO": &proto,
 		"MAC":   &macaddr,
+		"FLAGS": &tcpf,
+		"LEN":   &length,
 	}
 
 	for _, item := range split {
@@ -136,27 +150,49 @@ func process(line string) LogEntry {
 				*i = e
 			}
 		}
+
 		for _, f := range tcpflags {
 			if strings.EqualFold(item, f) {
-				l.TCPFlags = append(l.TCPFlags, f)
+				comma := ""
+				cur := *atlas["FLAGS"]
+				if len(cur) > 0 {
+					comma = ","
+				}
+				*atlas["FLAGS"] = cur + comma + f
 			}
 		}
 	}
+
+	return atlas
+}
+
+func process(line string) (l LogEntry) {
+	split := strings.Split(line, " ")
+	split = clean(split)
+	l.Time = parseTime(split)
+	atlas := mapValues(split)
 
 	if len(*atlas["IN"]) > 0 {
 		l.Interface = *atlas["IN"]
 	}
 
-	if src, err := netaddr.ParseIPPort(v6adapt(srcaddr) + ":" + *atlas["SPT"]); err != nil {
-		fmt.Println("SRC: " + v6adapt(srcaddr) + ":" + *atlas["SPT"] + "(" + err.Error() + ")")
-	} else {
-		l.Source = src
+	if sip := net.ParseIP(*atlas["SRC"]); sip != nil {
+		l.Loopback = sip.IsLoopback()
+		if sip.IsPrivate() || sip.IsLinkLocalMulticast() || sip.IsLinkLocalUnicast() {
+			l.LAN = true
+		}
 	}
 
-	if dst, err := netaddr.ParseIPPort(v6adapt(dstaddr) + ":" + *atlas["DPT"]); err != nil {
-		fmt.Println("DST: " + v6adapt(dstaddr) + ":" + *atlas["DPT"] + "(" + err.Error() + ")")
+	if src, err := netaddr.ParseIPPort(v6adapt(*atlas["SRC"]) + ":" + *atlas["SPT"]); err == nil {
+		l.Source = src
 	} else {
+		fmt.Println("SRC: " + v6adapt(*atlas["SRC"]) + ":" + *atlas["SPT"] + "(" + err.Error() + ")")
+	}
+
+	if dst, err := netaddr.ParseIPPort(v6adapt(*atlas["DST"]) + ":" + *atlas["DPT"]); err == nil {
 		l.Destination = dst
+	} else {
+		fmt.Println("DST: " + v6adapt(*atlas["DST"]) + ":" + *atlas["DPT"] + "(" + err.Error() + ")")
 	}
 
 	l.Protocol = *atlas["PROTO"]
@@ -170,17 +206,21 @@ func main() {
 	var source = make(map[string][]LogEntry)
 	for _, line := range lines {
 		entry := process(line)
+
+		if entry.LAN || entry.Loopback {
+			continue
+		}
+
 		mu.Lock()
 		source[entry.Source.IP().String()] = append(source[entry.Source.IP().String()], entry)
 		mu.Unlock()
-
 		/*suffix := ""
 		if entry.Protocol == "TCP" {
 			suffix = "| Flags: " + strings.Join(entry.TCPFlags, ",")
 		}
 		fmt.Printf("\nProtocol: %s | Source: %s %s", entry.Protocol, entry.Source.String(), suffix)*/
 	}
-	fmt.Printf("\nProcessed %d unique IPs...\n")
+	fmt.Printf("\nProcessed %d unique IPs...\n", len(source))
 
 	ct := make(Counts, len(source))
 	i := 0
@@ -189,10 +229,12 @@ func main() {
 		i++
 	}
 
-	sort.Sort(ct)
+	sort.Sort(sort.Reverse(ct))
 
 	for _, k := range ct {
-		fmt.Printf("%v\t%v\n", k.Source, k.Length)
+		if k.Length > 5 {
+			fmt.Printf("%v\t%v\n", k.Source, k.Length)
+		}
 	}
 
 }
